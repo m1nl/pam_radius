@@ -162,6 +162,7 @@ typedef struct radius_conf_t {
 	char prompt[MAXPROMPT];
 	int prompt_attribute;
 	int privilege_level;
+	unsigned char rstrip_response;
 } radius_conf_t;
 
 #endif /* PAM_RADIUS_H */

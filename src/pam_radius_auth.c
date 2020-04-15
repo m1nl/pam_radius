@@ -130,6 +130,9 @@ static int _pam_parse(int argc, CONST char **argv, radius_conf_t *conf)
 		} else if (!strcmp(*argv, "privilege_level")) {
 			conf->privilege_level = TRUE;
 
+		} else if (!strncmp(*argv, "rstrip_response=", 16)) {
+			conf->rstrip_response = atoi(*argv+16);
+
 		} else {
 			_pam_log(LOG_WARNING, "unrecognized option '%s'", *argv);
 		}
@@ -1162,6 +1165,8 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh,int flags,int argc,CONST c
 	CONST char *user;
 	CONST char *userinfo;
 	char *password = NULL;
+	char *p_stripped_response = NULL;
+	char *radius_password = NULL;
 	CONST char *rhost;
 	char *resp2challenge = NULL;
 	int ctrl;
@@ -1251,7 +1256,7 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh,int flags,int argc,CONST c
 		}
 
 		/* check to see if we send a NULL password the first time around */
-		if (!(ctrl & PAM_SKIP_PASSWD)) {
+		if (!(ctrl & PAM_SKIP_PASSWD) || config.force_prompt) {
 			retval = rad_converse(pamh, PAM_PROMPT_ECHO_OFF, config.prompt, &password);
 			PAM_FAIL_CHECK;
 
@@ -1260,7 +1265,44 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh,int flags,int argc,CONST c
 		}
 	} /* end of password == NULL */
 
-	build_radius_packet(request, user, password, &config);
+	/* try to strip a valid, numeric challenged-response from the end of the password */
+	if (password && config.rstrip_response > 0) {
+		size_t password_len = strlen(password);
+
+		if (password_len >= config.rstrip_response) {
+			char *password_end = password + password_len;
+			p_stripped_response = password_end;
+
+			while (password_end - p_stripped_response < config.rstrip_response) {
+				p_stripped_response--;
+
+				if (!isdigit(*p_stripped_response)) {
+					p_stripped_response = NULL;
+					break;
+				}
+			}
+		}
+	}
+
+	/* assign the password to the radius request */
+	if (password && !(ctrl & PAM_SKIP_PASSWD)) {
+		size_t radius_password_len = strlen(password);
+
+		if (p_stripped_response) {
+			/* strip the challenge-response from the radius password if password is being sent in the request */
+			radius_password_len -= strlen(p_stripped_response);
+		}
+
+		radius_password = strndup(password, radius_password_len);
+
+		DPRINT(LOG_DEBUG, "Using %s as RADIUS password", radius_password);
+	} else {
+		radius_password = strdup("");
+
+		DPRINT(LOG_DEBUG, "Using empty RADIUS password", radius_password);
+	}
+
+	build_radius_packet(request, user, radius_password, &config);
 	/* not all servers understand this service type, but some do */
 	add_int_attribute(request, PW_USER_SERVICE_TYPE, PW_AUTHENTICATE_ONLY);
 
@@ -1279,10 +1321,20 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh,int flags,int argc,CONST c
 
 	DPRINT(LOG_DEBUG, "Sending RADIUS request code %d", request->code);
 
-	retval = talk_radius(&config, request, response, password, NULL, config.retries + 1);
+	retval = talk_radius(&config, request, response, radius_password, NULL, config.retries + 1);
 	PAM_FAIL_CHECK;
 
 	DPRINT(LOG_DEBUG, "Got RADIUS response code %d", response->code);
+
+	/* If an access challenge is issued, strip the response from the password before passing it further */
+	if (response->code == PW_ACCESS_CHALLENGE && p_stripped_response) {
+		/* duplicate the challenge-response... */
+		resp2challenge = strdup(p_stripped_response);
+		/* ...and strip it from the password */
+		memset(p_stripped_response, '\0', strlen(p_stripped_response));
+
+		DPRINT(LOG_DEBUG, "Cut the password into %s and challenge-response %s", password, resp2challenge);
+	}
 
 	/*
 	 *	If we get an authentication failure, and we sent a NULL password,
@@ -1317,21 +1369,23 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh,int flags,int argc,CONST c
 		memcpy(challenge, a_reply->data, a_reply->length - 2);
 		challenge[a_reply->length - 2] = 0;
 
-		/* It's full challenge-response, default to echo on, unless the server wants it off */
-		prompt = PAM_PROMPT_ECHO_ON;
-                if (config.prompt_attribute) {
-			if((a_prompt = find_attribute(response, PW_PROMPT)) != NULL){
-				uint32_t prompt_val_net = 0;
-				uint32_t prompt_val = 0;
-				memcpy((void *)&prompt_val_net, (void *) a_prompt->data, sizeof(uint32_t));
-				prompt_val = ntohl(prompt_val_net);
-				DPRINT(LOG_DEBUG, "Got Prompt=%d",prompt_val);
-				if(!prompt_val) prompt=PAM_PROMPT_ECHO_OFF;
+		if (!resp2challenge) {
+			/* It's full challenge-response, default to echo on, unless the server wants it off */
+			prompt = PAM_PROMPT_ECHO_ON;
+	                if (config.prompt_attribute) {
+				if((a_prompt = find_attribute(response, PW_PROMPT)) != NULL){
+					uint32_t prompt_val_net = 0;
+					uint32_t prompt_val = 0;
+					memcpy((void *)&prompt_val_net, (void *) a_prompt->data, sizeof(uint32_t));
+					prompt_val = ntohl(prompt_val_net);
+					DPRINT(LOG_DEBUG, "Got Prompt=%d",prompt_val);
+					if(!prompt_val) prompt=PAM_PROMPT_ECHO_OFF;
+				}
 			}
-		}
 
-		retval = rad_converse(pamh, prompt, challenge, &resp2challenge);
-		PAM_FAIL_CHECK;
+			retval = rad_converse(pamh, prompt, challenge, &resp2challenge);
+			PAM_FAIL_CHECK;
+		}
 
 		/* now that we've got a response, build a new radius packet */
 		build_radius_packet(request, user, resp2challenge, &config);
@@ -1347,6 +1401,7 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh,int flags,int argc,CONST c
 		add_attribute(request, PW_STATE, a_state->data, a_state->length - 2);
 
 		retval = talk_radius(&config, request, response, resp2challenge, NULL, 1);
+		_pam_forget(resp2challenge);
 		PAM_FAIL_CHECK;
 
 		DPRINT(LOG_DEBUG, "Got response to challenge code %d", response->code);
@@ -1445,6 +1500,7 @@ do_next:
 		close(config.sockfd6);
 	cleanup(config.server);
 	_pam_forget(password);
+	_pam_forget(radius_password);
 	_pam_forget(resp2challenge);
 	{
 		int *pret = malloc(sizeof(int));
